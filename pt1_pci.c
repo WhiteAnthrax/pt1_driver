@@ -3,22 +3,34 @@
 #define DRV_NAME	"pt1-pci"
 #include "version.h"
 
+//#include <uapi/asm-generic/posix_types.h>
+//#include <uapi/asm/signal.h>
+//#include <asm/processor-flags.h>
+//#include <asm/msr.h>
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/pci.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/vmalloc.h>
 
-//#include <asm/system.h>
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/mutex.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,2,0)
+  #include <linux/vmalloc.h>
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,23)
-#include <linux/freezer.h>
+  #include <linux/freezer.h>
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
+    #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
+      #include <linux/smp_lock.h>
+    #endif
+  #endif
 #else
 #define set_freezable()
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,11)
@@ -55,7 +67,7 @@ MODULE_AUTHOR("Tomoaki Ishikawa tomy@users.sourceforge.jp and Yoshiki Yazawa yaz
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
 
-static int debug = 7;			/* 1 normal messages, 0 quiet .. 7 verbose. */
+static int debug = 1;			/* 1 normal messages, 0 quiet .. 7 verbose. */
 static int lnb = 0;			/* LNB OFF:0 +11V:1 +15V:2 */
 
 module_param(debug, int, 0);
@@ -75,18 +87,18 @@ static struct pci_device_id pt1_pci_tbl[] = {
 MODULE_DEVICE_TABLE(pci, pt1_pci_tbl);
 #define		DEV_NAME	"pt1video"
 
-#define		PACKET_SIZE			188		// 1•—•±•√•»ƒπ
-#define		MAX_READ_BLOCK	4			// 1≈Ÿ§À∆…§ﬂΩ–§π∫«¬ÁDMA•–•√•’•°øÙ
-#define		MAX_PCI_DEVICE		128		// ∫«¬Á64ÀÁ
-#define		DMA_SIZE	4096			// DMA•–•√•’•°•µ•§•∫
-#define		DMA_RING_SIZE	128			// number of DMA RINGS
-#define		DMA_RING_MAX	511			// number of DMA entries in a RING(1023§œNG§«511§ﬁ§«)
-#define		CHANNEL_DMA_SIZE	(2*1024*1024)	// √œ•«•∏Õ—(16Mbps)
-#define		BS_CHANNEL_DMA_SIZE	(4*1024*1024)	// BSÕ—(32Mbps)
-#define		READ_SIZE	(16*DMA_SIZE)
+#define		PACKET_SIZE			188		// 1„Éë„Ç±„ÉÉ„ÉàÈï∑
+#define		MAX_READ_BLOCK	4			// 1Â∫¶„Å´Ë™≠„ÅøÂá∫„ÅôÊúÄÂ§ßDMA„Éê„ÉÉ„Éï„Ç°Êï∞
+#define		MAX_PCI_DEVICE		128		// ÊúÄÂ§ß64Êûö
+#define		DMA_SIZE	4096			// DMA„Éê„ÉÉ„Éï„Ç°„Çµ„Ç§„Ç∫
+#define		DMA_RING_SIZE	128			// RING„Çµ„Ç§„Ç∫
+#define		DMA_RING_MAX	511			// 1RING„Å´„ÅÑ„Åè„Å§Ë©∞„ÇÅ„Çã„Åã(1023„ÅØNG„Åß511„Åæ„Åß)
+#define		MAX_READ_SIZE	(1024 * 4)
+#define		CHANEL_DMA_SIZE	(2*1024*1024)	// Âú∞„Éá„Ç∏Áî®(16Mbps)
+#define		BS_CHANEL_DMA_SIZE	(4*1024*1024)	// BSÁî®(32Mbps)
 
 typedef	struct	_DMA_CONTROL{
-	dma_addr_t	ring_dma[DMA_RING_MAX] ;	// DMAæ Û
+	dma_addr_t	ring_dma[DMA_RING_MAX] ;	// DMAÊÉÖÂ†±
 	__u32		*data[DMA_RING_MAX];
 }DMA_CONTROL;
 
@@ -97,7 +109,7 @@ typedef	struct	_pt1_device{
 	__u32			mmio_len ;
 	void __iomem		*regs;
 	struct mutex		lock ;
-	dma_addr_t		ring_dma[DMA_RING_SIZE] ;	// DMAæ Û
+	dma_addr_t		ring_dma[DMA_RING_SIZE] ;	// DMAÊÉÖÂ†±
 	void			*dmaptr[DMA_RING_SIZE] ;
 	struct	task_struct	*kthread;
 	dev_t			dev ;
@@ -116,29 +128,29 @@ typedef	struct	_MICRO_PACKET{
 }MICRO_PACKET;
 
 struct	_PT1_CHANNEL{
-	__u32			valid ;			// ª»Õ—√Ê•’•È•∞
-	__u32			address ;		// I2C•¢•…•Ï•π
-	__u32			channel ;		// •¡•„•Õ•Î»÷πÊ
-	int			type ;			// •¡•„•Õ•Î•ø•§•◊
-	__u32			packet_size ;	// •—•±•√•»•µ•§•∫
-	__u32			drop ;			// •—•±•√•»•…•Ì•√•◊øÙ
-	struct mutex		lock ;			// CH Ãmutex_lockÕ—
-	__u32			size ;			// DMA§µ§Ï§ø•µ•§•∫
-	__u32			maxsize ;		// DMAÕ—•–•√•’•°•µ•§•∫
-	__u32			bufsize ;		// •¡•„•Õ•Î§À≥‰§Íø∂§È§Ï§ø•µ•§•∫
-	__u32			overflow ;		// •™°º•–°º•’•Ì°º•®•È°º»Ø¿∏
-	__u32			counetererr ;	// ≈æ¡˜•´•¶•Û•ø£±•®•È°º
-	__u32			transerr ;		// ≈æ¡˜•®•È°º
-	__u32			minor ;			// •ﬁ•§• °º»÷πÊ
-	__u8			*buf;			// CH ÃºıøÆ•·•‚•Í
+	__u32			valid ;			// ‰ΩøÁî®‰∏≠„Éï„É©„Ç∞
+	__u32			address ;		// I2C„Ç¢„Éâ„É¨„Çπ
+	__u32			channel ;		// „ÉÅ„É£„Éç„É´Áï™Âè∑
+	int			type ;			// „ÉÅ„É£„Éç„É´„Çø„Ç§„Éó
+	__u32			packet_size ;	// „Éë„Ç±„ÉÉ„Éà„Çµ„Ç§„Ç∫
+	__u32			drop ;			// „Éë„Ç±„ÉÉ„Éà„Éâ„É≠„ÉÉ„ÉóÊï∞
+	struct mutex		lock ;			// CHÂà•mutex_lockÁî®
+	__u32			size ;			// DMA„Åï„Çå„Åü„Çµ„Ç§„Ç∫
+	__u32			maxsize ;		// DMAÁî®„Éê„ÉÉ„Éï„Ç°„Çµ„Ç§„Ç∫
+	__u32			bufsize ;		// „ÉÅ„É£„Éç„É´„Å´Ââ≤„ÇäÊåØ„Çâ„Çå„Åü„Çµ„Ç§„Ç∫
+	__u32			overflow ;		// „Ç™„Éº„Éê„Éº„Éï„É≠„Éº„Ç®„É©„ÉºÁô∫Áîü
+	__u32			counetererr ;	// Ëª¢ÈÄÅ„Ç´„Ç¶„É≥„ÇøÔºë„Ç®„É©„Éº
+	__u32			transerr ;		// Ëª¢ÈÄÅ„Ç®„É©„Éº
+	__u32			minor ;			// „Éû„Ç§„Éä„ÉºÁï™Âè∑
+	__u8			*buf;			// CHÂà•Âèó‰ø°„É°„É¢„É™
 	__u32			pointer;
-	__u8			req_dma ;		// ∞Ó§Ï§ø•¡•„•Õ•Î
-	__u8			packet_buf[PACKET_SIZE] ;		// ∞Ó§Ï§ø•¡•„•Õ•Î
-	PT1_DEVICE		*ptr ;			// •´°º•… Ãæ Û
+	__u8			req_dma ;		// Ê∫¢„Çå„Åü„ÉÅ„É£„Éç„É´
+	__u8			packet_buf[PACKET_SIZE] ;		// Ê∫¢„Çå„Åü„ÉÅ„É£„Éç„É´
+	PT1_DEVICE		*ptr ;			// „Ç´„Éº„ÉâÂà•ÊÉÖÂ†±
 	wait_queue_head_t	wait_q ;	// for poll on reading
 };
 
-// I2C•¢•…•Ï•π(video0, 1 = ISDB-S) (video2, 3 = ISDB-T)
+// I2C„Ç¢„Éâ„É¨„Çπ(video0, 1 = ISDB-S) (video2, 3 = ISDB-T)
 int		i2c_address[MAX_CHANNEL] = {T0_ISDB_S, T1_ISDB_S, T0_ISDB_T, T1_ISDB_T};
 int		real_channel[MAX_CHANNEL] = {0, 2, 1, 3};
 int		channeltype[MAX_CHANNEL] = {CHANNEL_TYPE_ISDB_S, CHANNEL_TYPE_ISDB_S,
@@ -150,6 +162,10 @@ static struct class	*pt1video_class;
 #define		PT1MAJOR	251
 #define		DRIVERNAME	"pt1video"
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
+static DEFINE_MUTEX(pt1_ioctl_mutex);
+#endif
+
 static	void	reset_dma(PT1_DEVICE *dev_conf)
 {
 
@@ -159,25 +175,25 @@ static	void	reset_dma(PT1_DEVICE *dev_conf)
 	int		data_pos = 0 ;
 	__u32	*dataptr ;
 
-	// •«°º•øΩÈ¥¸≤Ω
+	// „Éá„Éº„ÇøÂàùÊúüÂåñ
 	for(ring_pos = 0 ; ring_pos < DMA_RING_SIZE ; ring_pos++){
 		for(data_pos = 0 ; data_pos < DMA_RING_MAX ; data_pos++){
 			dataptr = (dev_conf->dmactl[ring_pos])->data[data_pos];
 			dataptr[(DMA_SIZE / sizeof(__u32)) - 2] = 0;
 		}
 	}
-	// ≈æ¡˜•´•¶•Û•ø§Ú•Í•ª•√•»
+	// Ëª¢ÈÄÅ„Ç´„Ç¶„É≥„Çø„Çí„É™„Çª„ÉÉ„Éà
 	writel(0x00000010, dev_conf->regs);
-	// ≈æ¡˜•´•¶•Û•ø§Ú•§•Û•Ø•Í•·•Û•»
+	// Ëª¢ÈÄÅ„Ç´„Ç¶„É≥„Çø„Çí„Ç§„É≥„ÇØ„É™„É°„É≥„Éà
 	for(lp = 0 ; lp < DMA_RING_SIZE ; lp++){
 		writel(0x00000020, dev_conf->regs);
 	}
 
 	addr = (int)dev_conf->ring_dma[0] ;
 	addr >>= 12 ;
-	// DMA•–•√•’•°¿ﬂƒÍ
+	// DMA„Éê„ÉÉ„Éï„Ç°Ë®≠ÂÆö
 	writel(addr, dev_conf->regs + DMA_ADDR);
-	// DMA≥´ªœ
+	// DMAÈñãÂßã
 	writel(0x0c000040, dev_conf->regs);
 
 }
@@ -189,6 +205,7 @@ static	int		pt1_thread(void *data)
 	int		data_pos = 0 ;
 	int		lp ;
 	int		chno ;
+	int		lp2 ;
 	int		dma_channel ;
 	int		packet_pos ;
 	__u32	*dataptr ;
@@ -210,7 +227,7 @@ static	int		pt1_thread(void *data)
 
 		for(;;){
 			dataptr = (dev_conf->dmactl[ring_pos])->data[data_pos];
-			// •«°º•ø§¢§Í°©
+			// „Éá„Éº„Çø„ÅÇ„ÇäÔºü
 			if(dataptr[(DMA_SIZE / sizeof(__u32)) - 2] == 0){
 				break ;
 			}
@@ -220,7 +237,7 @@ static	int		pt1_thread(void *data)
 			for(lp = 0 ; lp < (DMA_SIZE / sizeof(__u32)) ; lp++, dataptr++){
 				micro.val = *dataptr ;
 				dma_channel = ((micro.packet.head >> 5) & 0x07);
-				//•¡•„•Õ•Îæ Û…‘¿µ
+				//„ÉÅ„É£„Éç„É´ÊÉÖÂ†±‰∏çÊ≠£
 				if(dma_channel > MAX_CHANNEL){
 					printk(KERN_ERR "DMA Channel Number Error(%d)\n", dma_channel);
 					continue ;
@@ -228,7 +245,7 @@ static	int		pt1_thread(void *data)
 				chno = real_channel[(((micro.packet.head >> 5) & 0x07) - 1)];
 				packet_pos = ((micro.packet.head >> 2) & 0x07);
 				channel = dev_conf->channel[chno] ;
-				//  •®•È°º•¡•ß•√•Ø
+				//  „Ç®„É©„Éº„ÉÅ„Çß„ÉÉ„ÇØ
 				if((micro.packet.head & MICROPACKET_ERROR)){
 					val = readl(dev_conf->regs);
 					if((val & BIT_RAM_OVERFLOW)){
@@ -240,24 +257,24 @@ static	int		pt1_thread(void *data)
 					if((val & BIT_INITIATOR_WARNING)){
 						channel->transerr += 1 ;
 					}
-					// ΩÈ¥¸≤Ω§∑§∆¿Ë∆¨§´§È
+					// ÂàùÊúüÂåñ„Åó„Å¶ÂÖàÈ†≠„Åã„Çâ
 					reset_dma(dev_conf);
 					ring_pos = data_pos = 0 ;
 					break ;
 				}
-				// Ã§ª»Õ—•¡•„•Õ•Î§œºŒ§∆§Î
+				// Êú™‰ΩøÁî®„ÉÅ„É£„Éç„É´„ÅØÊç®„Å¶„Çã
 				if(channel->valid == FALSE){
 					continue ;
 				}
 				mutex_lock(&channel->lock);
-				// §¢§’§Ï§ø§È∆…§ﬂΩ–§π§ﬁ§«¬‘§ƒ
+				// „ÅÇ„Åµ„Çå„Åü„ÇâË™≠„ÅøÂá∫„Åô„Åæ„ÅßÂæÖ„Å§
 				while(1){
 					if(channel->size >= (channel->maxsize - PACKET_SIZE - 4)){
-						// ≥∫≈ˆ•¡•„•Û•Õ•Î§ŒDMA∆…§ﬂ§¿§∑¬‘§¡§À§π§Î
+						// Ë©≤ÂΩì„ÉÅ„É£„É≥„Éç„É´„ÅÆDMAË™≠„Åø„Å†„ÅóÂæÖ„Å°„Å´„Åô„Çã
 						wake_up(&channel->wait_q);
 						channel->req_dma = TRUE ;
 						mutex_unlock(&channel->lock);
-						// •ø•π•Ø§Àª˛¥÷§Ú≈œ§π∞Ÿ√Ê√«
+						// „Çø„Çπ„ÇØ„Å´ÊôÇÈñì„ÇíÊ∏°„ÅôÁÇ∫‰∏≠Êñ≠
 						wait_event_timeout(dev_conf->dma_wait_q, (channel->req_dma == FALSE),
 											msecs_to_jiffies(500));
 						mutex_lock(&channel->lock);
@@ -266,32 +283,32 @@ static	int		pt1_thread(void *data)
 						break ;
 					}
 				}
-				// ¿Ë∆¨§«°¢∞Ïª˛•–•√•’•°§Àªƒ§√§∆§§§ÎæÏπÁ
+				// ÂÖàÈ†≠„Åß„ÄÅ‰∏ÄÊôÇ„Éê„ÉÉ„Éï„Ç°„Å´ÊÆã„Å£„Å¶„ÅÑ„ÇãÂ†¥Âêà
 				if((micro.packet.head & 0x02) &&  (channel->packet_size != 0)){
 					channel->packet_size = 0 ;
 				}
-				// •«°º•ø•≥•‘°º
-				channel->packet_buf[channel->packet_size]   = micro.packet.data[2];
-				channel->packet_buf[channel->packet_size+1] = micro.packet.data[1];
-				channel->packet_buf[channel->packet_size+2] = micro.packet.data[0];
-				channel->packet_size += 3;
+				// „Éá„Éº„Çø„Ç≥„Éî„Éº
+				for(lp2 = 2 ; lp2 >= 0 ; lp2--){
+					channel->packet_buf[channel->packet_size] = micro.packet.data[lp2] ;
+					channel->packet_size += 1 ;
+				}
 
-				// •—•±•√•»§¨Ω–ÕË§ø§È•≥•‘°º§π§Î
+				// „Éë„Ç±„ÉÉ„Éà„ÅåÂá∫Êù•„Åü„Çâ„Ç≥„Éî„Éº„Åô„Çã
 				if(channel->packet_size >= PACKET_SIZE){
 					if (channel->pointer + channel->size >= channel->maxsize) {
-						// •Í•Û•∞•–•√•’•°§Œ∂≠≥¶§Ú±€§®§∆§§§∆•Í•Û•∞•–•√•’•°§Œ¿Ë∆¨§ÀÃ·§√§∆§§§ÎæÏπÁ
-						// channel->pointer + channel->size - channel->maxsize §«•Í•Û•∞•–•√•’•°¿Ë∆¨§´§È§Œ•¢•…•Ï•π§À§ §Î
+						// „É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°„ÅÆÂ¢ÉÁïå„ÇíË∂ä„Åà„Å¶„ÅÑ„Å¶„É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°„ÅÆÂÖàÈ†≠„Å´Êàª„Å£„Å¶„ÅÑ„ÇãÂ†¥Âêà
+						// channel->pointer + channel->size - channel->maxsize „Åß„É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°ÂÖàÈ†≠„Åã„Çâ„ÅÆ„Ç¢„Éâ„É¨„Çπ„Å´„Å™„Çã
 						memcpy(&channel->buf[channel->pointer + channel->size - channel->maxsize], channel->packet_buf, PACKET_SIZE);
 					} else if (channel->pointer + channel->size + PACKET_SIZE > channel->maxsize) {
-						// •Í•Û•∞•–•√•’•°§Œ∂≠≥¶§Ú§ﬁ§ø§∞§Ë§¶§ÀΩÒ§≠π˛§ﬁ§Ï§ÎæÏπÁ
-						// •Í•Û•∞•–•√•’•°§Œ∂≠≥¶§ﬁ§«ΩÒ§≠π˛§ﬂ
+						// „É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°„ÅÆÂ¢ÉÁïå„Çí„Åæ„Åü„Åê„Çà„ÅÜ„Å´Êõ∏„ÅçËæº„Åæ„Çå„ÇãÂ†¥Âêà
+						// „É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°„ÅÆÂ¢ÉÁïå„Åæ„ÅßÊõ∏„ÅçËæº„Åø
 						__u32 tmp_size = channel->maxsize - (channel->pointer + channel->size);
 						memcpy(&channel->buf[channel->pointer + channel->size], channel->packet_buf, tmp_size);
-						// ¿Ë∆¨§ÀÃ·§√§∆ΩÒ§≠π˛§ﬂ
+						// ÂÖàÈ†≠„Å´Êàª„Å£„Å¶Êõ∏„ÅçËæº„Åø
 						memcpy(channel->buf, &channel->packet_buf[tmp_size], PACKET_SIZE - tmp_size);
 					} else {
-						// •Í•Û•∞•–•√•’•°∆‚§«º˝§ﬁ§ÎæÏπÁ
-						// ƒÃæÔ§ŒΩÒ§≠π˛§ﬂ
+						// „É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°ÂÜÖ„ÅßÂèé„Åæ„ÇãÂ†¥Âêà
+						// ÈÄöÂ∏∏„ÅÆÊõ∏„ÅçËæº„Åø
 						memcpy(&channel->buf[channel->pointer + channel->size], channel->packet_buf, PACKET_SIZE);
 					}
 					channel->size += PACKET_SIZE ;
@@ -304,22 +321,22 @@ static	int		pt1_thread(void *data)
 			if(data_pos >= DMA_RING_MAX){
 				data_pos = 0;
 				ring_pos += 1 ;
-				// DMA•Í•Û•∞§¨ —§Ô§√§øæÏπÁ§œ•§•Û•Ø•Í•·•Û•»
+				// DMA„É™„É≥„Ç∞„ÅåÂ§â„Çè„Å£„ÅüÂ†¥Âêà„ÅØ„Ç§„É≥„ÇØ„É™„É°„É≥„Éà
 				writel(0x00000020, dev_conf->regs);
 				if(ring_pos >= DMA_RING_SIZE){
 					ring_pos = 0 ;
 				}
 			}
 
-			// …—≈Ÿ§ÚÕÓ§π(wait until READ_SIZE)
+			// È†ªÂ∫¶„ÇíËêΩ„Åô(4K„ÅßËµ∑Âãï„Åï„Åõ„Çã)
 			for(lp = 0 ; lp < MAX_CHANNEL ; lp++){
 				channel = dev_conf->channel[real_channel[lp]] ;
-				if((channel->size >= READ_SIZE) && (channel->valid == TRUE)){
+				if((channel->size >= MAX_READ_SIZE ) && (channel->valid == TRUE)){
 					wake_up(&channel->wait_q);
 				}
 			}
 		}
-		schedule_timeout_interruptible(msecs_to_jiffies(100));
+		schedule_timeout_interruptible(msecs_to_jiffies(10));
 	}
 	return 0 ;
 }
@@ -353,7 +370,7 @@ static int pt1_open(struct inode *inode, struct file *file)
 					set_sleepmode(channel->ptr->regs, &channel->lock,
 								  channel->address, channel->type,
 								  TYPE_WAKEUP);
-					schedule_timeout_interruptible(msecs_to_jiffies(100));
+					schedule_timeout_interruptible(msecs_to_jiffies(50));
 
 					channel->drop  = 0 ;
 					channel->valid = TRUE ;
@@ -363,7 +380,7 @@ static int pt1_open(struct inode *inode, struct file *file)
 					channel->packet_size = 0 ;
 					file->private_data = channel;
 					mutex_lock(&channel->lock);
-					// •«°º•øΩÈ¥¸≤Ω
+					// „Éá„Éº„ÇøÂàùÊúüÂåñ
 					channel->size = 0 ;
 					mutex_unlock(&channel->lock);
 					mutex_unlock(&device[lp]->lock);
@@ -387,17 +404,19 @@ static int pt1_release(struct inode *inode, struct file *file)
 	channel->counetererr = 0 ;
 	channel->transerr = 0 ;
 	channel->drop = 0 ;
-	// ƒ‰ªﬂ§∑§∆§§§ÎæÏπÁ§œµØ§≥§π
+	// ÂÅúÊ≠¢„Åó„Å¶„ÅÑ„ÇãÂ†¥Âêà„ÅØËµ∑„Åì„Åô
 	if(channel->req_dma == TRUE){
 		channel->req_dma = FALSE ;
 		wake_up(&channel->ptr->dma_wait_q);
 	}
-	mutex_unlock(&channel->ptr->lock);
+	//mutex_unlock(&channel->ptr->lock);
 
 	/* send tuner to sleep */
 	set_sleepmode(channel->ptr->regs, &channel->lock,
 				  channel->address, channel->type, TYPE_SLEEP);
-	schedule_timeout_interruptible(msecs_to_jiffies(100));
+	schedule_timeout_interruptible(msecs_to_jiffies(50));
+
+	mutex_unlock(&channel->ptr->lock);
 
 	return 0;
 }
@@ -408,9 +427,9 @@ static ssize_t pt1_read(struct file *file, char __user *buf, size_t cnt, loff_t 
 	__u32	size ;
 	unsigned long dummy;
 
-	// READ_SIZE√±∞Ã§«µØ§≥§µ§Ï§Î§Œ§Ú¬‘§ƒ(CPU…È≤Ÿ¬–∫ˆ)
-	if(channel->size < READ_SIZE){
-		wait_event_timeout(channel->wait_q, (channel->size >= READ_SIZE),
+	// 128KÂçò‰Ωç„ÅßËµ∑„Åì„Åï„Çå„Çã„ÅÆ„ÇíÂæÖ„Å§(CPUË≤†Ëç∑ÂØæÁ≠ñ)
+	if(channel->size < MAX_READ_SIZE){
+		wait_event_timeout(channel->wait_q, (channel->size >= MAX_READ_SIZE),
 							msecs_to_jiffies(500));
 	}
 	mutex_lock(&channel->lock);
@@ -419,28 +438,28 @@ static ssize_t pt1_read(struct file *file, char __user *buf, size_t cnt, loff_t 
 	}else{
 		__u32 tmp_size = 0;
 		if (cnt < channel->size) {
-			// •–•√•’•°§À§¢§Î•«°º•ø§Ë§ÍæÆ§µ§§∆…§ﬂπ˛§ﬂ§ŒæÏπÁ
+			// „Éê„ÉÉ„Éï„Ç°„Å´„ÅÇ„Çã„Éá„Éº„Çø„Çà„ÇäÂ∞è„Åï„ÅÑË™≠„ÅøËæº„Åø„ÅÆÂ†¥Âêà
 			size = cnt;
 		} else {
-			// •–•√•’•°§À§¢§Î•«°º•ø∞ æÂ§Œ∆…§ﬂπ˛§ﬂ§ŒæÏπÁ
+			// „Éê„ÉÉ„Éï„Ç°„Å´„ÅÇ„Çã„Éá„Éº„Çø‰ª•‰∏ä„ÅÆË™≠„ÅøËæº„Åø„ÅÆÂ†¥Âêà
 			size = channel->size;
 		}
 		if (channel->maxsize <= size + channel->pointer) {
-			// •Í•Û•∞•–•√•’•°§Œ∂≠≥¶§Ú±€§®§ÎæÏπÁ
+			// „É™„É≥„Ç∞„Éê„ÉÉ„Éï„Ç°„ÅÆÂ¢ÉÁïå„ÇíË∂ä„Åà„ÇãÂ†¥Âêà
 			tmp_size = channel->maxsize - channel->pointer;
-			// ∂≠≥¶§ﬁ§«•≥•‘°º
+			// Â¢ÉÁïå„Åæ„Åß„Ç≥„Éî„Éº
 			dummy = copy_to_user(buf, &channel->buf[channel->pointer], tmp_size);
-			// ªƒ§Í§Ú•≥•‘°º
+			// ÊÆã„Çä„Çí„Ç≥„Éî„Éº
 			dummy = copy_to_user(&buf[tmp_size], channel->buf, size - tmp_size);
 			channel->pointer = size - tmp_size;
 		} else {
-			// …·ƒÃ§À•≥•‘°º
+			// ÊôÆÈÄö„Å´„Ç≥„Éî„Éº
 			dummy = copy_to_user(buf, &channel->buf[channel->pointer], size);
 			channel->pointer += size;
 		}
 		channel->size -= size;
 	}
-	// ∆…§ﬂΩ™§Ô§√§ø§´§ƒª»Õ—§∑§∆§§§Î§Œ§¨§¨4K∞ ≤º
+	// Ë™≠„ÅøÁµÇ„Çè„Å£„Åü„Åã„Å§‰ΩøÁî®„Åó„Å¶„ÅÑ„Çã„ÅÆ„Åå„Åå4K‰ª•‰∏ã
 	if(channel->req_dma == TRUE){
 		channel->req_dma = FALSE ;
 		wake_up(&channel->ptr->dma_wait_q);
@@ -516,7 +535,7 @@ static int count_used_bs_tuners(PT1_DEVICE *device)
 	return count;
 }
 
-static long pt1_do_ioctl(struct file  *file, unsigned int cmd, unsigned long arg0)
+static	int	pt1_ioctl(struct inode *inode, struct file  *file, unsigned int cmd, unsigned long arg0)
 {
 	PT1_CHANNEL	*channel = file->private_data;
 	int		signal;
@@ -538,7 +557,7 @@ static long pt1_do_ioctl(struct file  *file, unsigned int cmd, unsigned long arg
 			return 0 ;
 		case STOP_REC:
 			SetStream(channel->ptr->regs, channel->channel, FALSE);
-			schedule_timeout_interruptible(msecs_to_jiffies(200));
+			schedule_timeout_interruptible(msecs_to_jiffies(100));
 			return 0 ;
 		case GET_SIGNAL_STRENGTH:
 			switch(channel->type){
@@ -560,7 +579,7 @@ static long pt1_do_ioctl(struct file  *file, unsigned int cmd, unsigned long arg
 				lnb_usr = (int)arg0;
 				lnb_eff = lnb_usr ? lnb_usr : lnb;
 				settuner_reset(channel->ptr->regs, channel->ptr->cardtype, lnb_eff, TUNER_POWER_ON_RESET_DISABLE);
-				//printk(KERN_INFO "PT1:LNB on %s\n", voltage[lnb_eff]);
+				printk(KERN_INFO "PT1:LNB on %s\n", voltage[lnb_eff]);
 			}
 			return 0 ;
 		case LNB_DISABLE:
@@ -574,33 +593,22 @@ static long pt1_do_ioctl(struct file  *file, unsigned int cmd, unsigned long arg
 	return -EINVAL;
 }
 
-static long pt1_unlocked_ioctl(struct file  *file, unsigned int cmd, unsigned long arg0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36) 
+static long pt1_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	PT1_CHANNEL	*channel = file->private_data;
-	long ret;
+	long rc;
 
-	mutex_lock(&channel->lock);
-	ret = pt1_do_ioctl(file, cmd, arg0);
-	mutex_unlock(&channel->lock);
-
-	return ret;
-}
-
-static long pt1_compat_ioctl(struct file  *file, unsigned int cmd, unsigned long arg0)
-{
-	long ret;
-	/* should do 32bit <-> 64bit conversion here? --yaz */
-	ret = pt1_unlocked_ioctl(file, cmd, arg0);
-
-	return ret;
-}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,36)
-static int pt1_ioctl(struct inode *inode, struct file  *file, unsigned int cmd, unsigned long arg0)
-{
-	int ret;
-	ret = (int)pt1_do_ioctl(file, cmd, arg0);
-	return ret;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
+	if(mutex_lock_interruptible(&pt1_ioctl_mutex))
+		return -EINTR;
+	rc = pt1_ioctl(file->f_path.dentry->d_inode, file, cmd, arg);
+	mutex_unlock(&pt1_ioctl_mutex);
+#else
+	lock_kernel();
+	rc = pt1_ioctl(file->f_path.dentry->d_inode, file, cmd, arg);
+	unlock_kernel();
+#endif
+	return rc;
 }
 #endif
 
@@ -611,11 +619,10 @@ static const struct file_operations pt1_fops = {
 	.open		=	pt1_open,
 	.release	=	pt1_release,
 	.read		=	pt1_read,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,36)
-	.ioctl		=	pt1_ioctl,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
+	.unlocked_ioctl	=	pt1_unlocked_ioctl,
 #else
-	.unlocked_ioctl		=	pt1_unlocked_ioctl,
-	.compat_ioctl		=	pt1_compat_ioctl,
+	.ioctl		=	pt1_ioctl,
 #endif
 	.llseek		=	no_llseek,
 };
@@ -629,7 +636,7 @@ int		pt1_makering(struct pci_dev *pdev, PT1_DEVICE *dev_conf)
 	__u32	addr  ;
 	__u32	*ptr ;
 
-	//DMA•Í•Û•∞∫Ó¿Æ
+	//DMA„É™„É≥„Ç∞‰ΩúÊàê
 	for(lp = 0 ; lp < DMA_RING_SIZE ; lp++){
 		ptr = dev_conf->dmaptr[lp];
 		if(lp ==  (DMA_RING_SIZE - 1)){
@@ -643,13 +650,14 @@ int		pt1_makering(struct pci_dev *pdev, PT1_DEVICE *dev_conf)
 
 		dmactl = dev_conf->dmactl[lp];
 		for(lp2 = 0 ; lp2 < DMA_RING_MAX ; lp2++){
-			dmaptr = pci_alloc_consistent(pdev, DMA_SIZE, &dmactl->ring_dma[lp2]);
+			//dmaptr = pci_alloc_consistent(pdev, DMA_SIZE, &dmactl->ring_dma[lp2]);
+      dmaptr = dma_alloc_coherent(&pdev->dev, DMA_SIZE, &dmactl->ring_dma[lp2], GFP_KERNEL);
 			if(dmaptr == NULL){
 				printk(KERN_INFO "PT1:DMA ALLOC ERROR\n");
 				return -1 ;
 			}
 			dmactl->data[lp2] = dmaptr ;
-			// DMA•«°º•ø•®•Í•¢ΩÈ¥¸≤Ω
+			// DMA„Éá„Éº„Çø„Ç®„É™„Ç¢ÂàùÊúüÂåñ
 			dmaptr[(DMA_SIZE / sizeof(__u32)) - 2] = 0 ;
 			addr = (__u32)dmactl->ring_dma[lp2];
 			addr >>= 12 ;
@@ -665,7 +673,8 @@ int		pt1_dma_init(struct pci_dev *pdev, PT1_DEVICE *dev_conf)
 	void	*ptr ;
 
 	for(lp = 0 ; lp < DMA_RING_SIZE ; lp++){
-		ptr = pci_alloc_consistent(pdev, DMA_SIZE, &dev_conf->ring_dma[lp]);
+		//ptr = pci_alloc_consistent(pdev, DMA_SIZE, &dev_conf->ring_dma[lp]);
+    ptr = dma_alloc_coherent(&pdev->dev, DMA_SIZE, &dev_conf->ring_dma[lp], GFP_KERNEL);
 		if(ptr == NULL){
 			printk(KERN_INFO "PT1:DMA ALLOC ERROR\n");
 			return -1 ;
@@ -683,13 +692,12 @@ int		pt1_dma_free(struct pci_dev *pdev, PT1_DEVICE *dev_conf)
 
 	for(lp = 0 ; lp < DMA_RING_SIZE ; lp++){
 		if(dev_conf->dmaptr[lp] != NULL){
-			pci_free_consistent(pdev, DMA_SIZE,
-								dev_conf->dmaptr[lp], dev_conf->ring_dma[lp]);
+			//pci_free_consistent(pdev, DMA_SIZE, dev_conf->dmaptr[lp], dev_conf->ring_dma[lp]);
+      dma_free_coherent(&pdev->dev, DMA_SIZE, dev_conf->dmaptr[lp], dev_conf->ring_dma[lp]);
 			for(lp2 = 0 ; lp2 < DMA_RING_MAX ; lp2++){
 				if((dev_conf->dmactl[lp])->data[lp2] != NULL){
-					pci_free_consistent(pdev, DMA_SIZE,
-										(dev_conf->dmactl[lp])->data[lp2],
-										(dev_conf->dmactl[lp])->ring_dma[lp2]);
+					//pci_free_consistent(pdev, DMA_SIZE, (dev_conf->dmactl[lp])->data[lp2], (dev_conf->dmactl[lp])->ring_dma[lp2]);
+          dma_free_coherent(&pdev->dev, DMA_SIZE, (dev_conf->dmactl[lp])->data[lp2], (dev_conf->dmactl[lp])->ring_dma[lp2]);
 				}
 			}
 		}
@@ -715,7 +723,8 @@ static int pt1_pci_init_one (struct pci_dev *pdev,
 	rc = pci_enable_device(pdev);
 	if (rc)
 		return rc;
-	rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+	//rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+  rc = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
 	if (rc) {
 		printk(KERN_ERR "PT1:DMA MASK ERROR");
 		return rc;
@@ -762,7 +771,7 @@ static int pt1_pci_init_one (struct pci_dev *pdev,
 		break;
 	}
 
-	// PCI•¢•…•Ï•π§Ú•ﬁ•√•◊§π§Î
+	// PCI„Ç¢„Éâ„É¨„Çπ„Çí„Éû„ÉÉ„Éó„Åô„Çã
 	dev_conf->mmio_start = pci_resource_start(pdev, 0);
 	dev_conf->mmio_len = pci_resource_len(pdev, 0);
 	dummy = request_mem_region(dev_conf->mmio_start, dev_conf->mmio_len, DEV_NAME);
@@ -776,20 +785,20 @@ static int pt1_pci_init_one (struct pci_dev *pdev,
 		printk(KERN_ERR "pt1:Can't remap register area.\n");
 		goto out_err_regbase;
 	}
-	// ΩÈ¥¸≤ΩΩËÕ˝
+	// ÂàùÊúüÂåñÂá¶ÁêÜ
 	if(xc3s_init(dev_conf->regs, dev_conf->cardtype)){
 		printk(KERN_ERR "Error xc3s_init\n");
 		goto out_err_fpga;
 	}
-	// •¡•Â°º• •Í•ª•√•»
+	// „ÉÅ„É•„Éº„Éä„É™„Çª„ÉÉ„Éà
 	settuner_reset(dev_conf->regs, dev_conf->cardtype, LNB_OFF, TUNER_POWER_ON_RESET_ENABLE);
-	schedule_timeout_interruptible(msecs_to_jiffies(100));
+	schedule_timeout_interruptible(msecs_to_jiffies(50));
 
 	settuner_reset(dev_conf->regs, dev_conf->cardtype, LNB_OFF, TUNER_POWER_ON_RESET_DISABLE);
-	schedule_timeout_interruptible(msecs_to_jiffies(100));
+	schedule_timeout_interruptible(msecs_to_jiffies(10));
 	mutex_init(&dev_conf->lock);
 
-	// Tuner ΩÈ¥¸≤ΩΩËÕ˝
+	// Tuner ÂàùÊúüÂåñÂá¶ÁêÜ
 	for(lp = 0 ; lp < MAX_TUNER ; lp++){
 		rc = tuner_init(dev_conf->regs, dev_conf->cardtype, &dev_conf->lock, lp);
 		if(rc < 0){
@@ -797,19 +806,19 @@ static int pt1_pci_init_one (struct pci_dev *pdev,
 			goto out_err_fpga;
 		}
 	}
-	// ΩÈ¥¸≤Ω¥∞Œª
+	// ÂàùÊúüÂåñÂÆå‰∫Ü
 	for(lp = 0 ; lp < MAX_CHANNEL ; lp++){
 		set_sleepmode(dev_conf->regs, &dev_conf->lock,
 						i2c_address[lp], channeltype[lp], TYPE_SLEEP);
 
-		schedule_timeout_interruptible(msecs_to_jiffies(100));
+		schedule_timeout_interruptible(msecs_to_jiffies(50));
 	}
 	rc = alloc_chrdev_region(&dev_conf->dev, 0, MAX_CHANNEL, DEV_NAME);
 	if(rc < 0){
 		goto out_err_fpga;
 	}
 
-	// ΩÈ¥¸≤Ω
+	// ÂàùÊúüÂåñ
 	init_waitqueue_head(&dev_conf->dma_wait_q);
 
 	minor = MINOR(dev_conf->dev) ;
@@ -833,16 +842,16 @@ static int pt1_pci_init_one (struct pci_dev *pdev,
 			return -ENOMEM ;
 		}
 
-		// ∂¶ƒÃæ Û
+		// ÂÖ±ÈÄöÊÉÖÂ†±
 		mutex_init(&channel->lock);
-		// ¬‘§¡æı¬÷§Ú≤ÚΩ¸
+		// ÂæÖ„Å°Áä∂ÊÖã„ÇíËß£Èô§
 		channel->req_dma = FALSE ;
-		// •ﬁ•§• °º»÷πÊ¿ﬂƒÍ
+		// „Éû„Ç§„Éä„ÉºÁï™Âè∑Ë®≠ÂÆö
 		channel->minor = MINOR(dev_conf->dev) + lp ;
-		// ¬–æ›§ŒI2C•«•–•§•π
+		// ÂØæË±°„ÅÆI2C„Éá„Éê„Ç§„Çπ
 		channel->address = i2c_address[lp] ;
 		channel->type = channeltype[lp] ;
-		// º¬∫›§Œ•¡•Â°º• »÷πÊ
+		// ÂÆüÈöõ„ÅÆ„ÉÅ„É•„Éº„ÉäÁï™Âè∑
 		channel->channel = real_channel[lp] ;
 		channel->ptr = dev_conf ;
 		channel->size = 0 ;
@@ -852,13 +861,13 @@ static int pt1_pci_init_one (struct pci_dev *pdev,
 
 		switch(channel->type){
 			case CHANNEL_TYPE_ISDB_T:
-				channel->maxsize = CHANNEL_DMA_SIZE ;
-				channel->buf = vmalloc(CHANNEL_DMA_SIZE);
+				channel->maxsize = CHANEL_DMA_SIZE ;
+				channel->buf = vmalloc(CHANEL_DMA_SIZE);
 				channel->pointer = 0;
 				break ;
 			case CHANNEL_TYPE_ISDB_S:
-				channel->maxsize = BS_CHANNEL_DMA_SIZE ;
-				channel->buf = vmalloc(BS_CHANNEL_DMA_SIZE);
+				channel->maxsize = BS_CHANEL_DMA_SIZE ;
+				channel->buf = vmalloc(BS_CHANEL_DMA_SIZE);
 				channel->pointer = 0;
 				break ;
 		}
@@ -944,14 +953,14 @@ static void pt1_pci_remove_one(struct pci_dev *pdev)
 			dev_conf->kthread = NULL;
 		}
 
-		// DMAΩ™Œª
+		// DMAÁµÇ‰∫Ü
 		writel(0x08080000, dev_conf->regs);
 		for(lp = 0 ; lp < 10 ; lp++){
 			val = readl(dev_conf->regs);
 			if(!(val & (1 << 6))){
 				break ;
 			}
-			schedule_timeout_interruptible(msecs_to_jiffies(100));
+			schedule_timeout_interruptible(msecs_to_jiffies(1));
 		}
 		pt1_dma_free(pdev, dev_conf);
 		for(lp = 0 ; lp < MAX_CHANNEL ; lp++){
@@ -1014,7 +1023,11 @@ static struct pci_driver pt1_driver = {
 static int __init pt1_pci_init(void)
 {
 	printk(KERN_INFO "%s", version);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
 	pt1video_class = class_create(THIS_MODULE, DRIVERNAME);
+#else
+	pt1video_class = class_create(DRIVERNAME);
+#endif
 	if (IS_ERR(pt1video_class))
 		return PTR_ERR(pt1video_class);
 	return pci_register_driver(&pt1_driver);
@@ -1023,8 +1036,8 @@ static int __init pt1_pci_init(void)
 
 static void __exit pt1_pci_cleanup(void)
 {
-	pci_unregister_driver(&pt1_driver);
 	class_destroy(pt1video_class);
+	pci_unregister_driver(&pt1_driver);
 }
 
 module_init(pt1_pci_init);
